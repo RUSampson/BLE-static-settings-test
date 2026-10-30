@@ -4,7 +4,8 @@
 
 ## Как открыть
 
-Chrome или Edge (Safari на iOS не поддерживает Web Bluetooth). Адрес страницы — во вкладке GitHub Pages настроек репозитория.
+Chrome или Edge (Safari на iOS не поддерживает Web Bluetooth):
+`https://rusampson.github.io/BLE-static-settings-test/`
 
 ## Как пользоваться
 

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluetooth Config Bench</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; background:#101318; color:#e6e9ef; margin:0; padding:24px; max-width:680px; margin-inline:auto; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin:22px 0 8px; color:#9fb0c8; text-transform:uppercase; letter-spacing:.04em; }
+  .card { background:#181d26; border:1px solid #2a3140; border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  button, input, select { font: inherit; border-radius:8px; border:1px solid #333d4f; background:#0f1319; color:#e6e9ef; padding:8px 12px; }
+  button { cursor:pointer; background:#2b62d9; border-color:#2b62d9; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.alt { background:#222a38; border-color:#333d4f; }
+  input, select { width: 100%; box-sizing:border-box; margin:4px 0 10px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; } .row > * { flex:1 1 auto; }
+  #log { background:#0b0e13; border:1px solid #232a37; border-radius:8px; padding:10px; min-height:120px; max-height:260px; overflow:auto; font:12px/1.45 ui-monospace, Menlo, monospace; white-space:pre-wrap; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#555; margin-right:6px; }
+  .dot.on { background:#3ddc84; } .dot.warn { background:#e8b93d; }
+  .muted { color:#7f8ca1; font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Bluetooth Config Bench</h1>
+<div class="muted" id="hint">Устройство должно быть в режиме настройки (индикатор мигает). Chrome / Edge, Bluetooth включён.</div>
+
+<div class="card">
+  <div><span class="dot" id="connDot"></span><b id="connText">не подключено</b></div>
+  <div class="row" style="margin-top:10px">
+    <button id="btnConn">Подключить</button>
+    <button id="btnDisc" class="alt" disabled>Отключить</button>
+  </div>
+</div>
+
+<div class="card" id="authCard" style="display:none">
+  <h2 style="margin-top:0">Доступ на запись</h2>
+  <input id="pin" type="password" inputmode="numeric" placeholder="пин-код" autocomplete="off">
+  <button id="btnAuth" style="width:100%">Разрешить запись</button>
+</div>
+
+<div class="card" id="wifiCard" style="display:none">
+  <h2 style="margin-top:0">Сеть</h2>
+  <div id="netState" class="muted">—</div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnRefresh" class="alt">Обновить статус</button>
+    <button id="btnScan" class="alt">Найти сети</button>
+  </div>
+  <h2>Wi-Fi</h2>
+  <select id="ssidSel"><option value="">— выберите сеть —</option></select>
+  <input id="ssidManual" placeholder="…или введите имя сети вручную" maxlength="32" pattern="[\x20-\x7e]{1,32}" title="Только печатные символы, до 32">
+  <input id="psk" type="text" placeholder="пароль сети" autocomplete="off" maxlength="63" pattern="[\x20-\x7e]{8,63}" title="8–63 печатных символа, или пусто для открытой сети">
+  <button id="btnSetWifi" style="width:100%">Сохранить Wi-Fi</button>
+  <h2>DNS</h2>
+  <input id="dnsIn" placeholder="DNS 1: auto или IPv4/IPv6 адрес, пример: 192.0.2.1" maxlength="45" title="Один IPv4/IPv6 адрес или auto">
+  <input id="dnsIn2" placeholder="DNS 2 (необязательно)" maxlength="45" title="Второй IPv4/IPv6 адрес, можно оставить пустым">
+  <div class="row">
+    <button id="btnDnsGet" class="alt">Показать текущий</button>
+    <button id="btnDnsSet">Сохранить DNS</button>
+  </div>
+</div>
+
+<h2>Журнал устройства</h2>
+<div id="log"></div>
+
+<script>
+const SVC = "73746174-696f-6e2d-6366-670000000001";
+const C_CMD = "73746174-696f-6e2d-6366-670000000002";
+const C_EVT = "73746174-696f-6e2d-6366-670000000003";
+let server=null, chCmd=null, chEvt=null, device=null;
+let buf="";            // сборка JSON из чанков уведомления
+let scanList=[];
+
+const $ = id => document.getElementById(id);
+const log = t => { const l=$("log"); l.textContent += (l.textContent?"\n":"") + t; l.scrollTop=l.scrollHeight; };
+
+function extractJson(s){
+  // вытаскиваем целые JSON-объекты из потока (скользкая работа со строками и escape)
+  const out=[]; let depth=0, start=-1, inStr=false, esc=false;
+  for(let i=0;i<s.length;i++){
+    const c=s[i];
+    if(inStr){ if(esc){esc=false;} else if(c==="\\"){esc=true;} else if(c==='"'){inStr=false;} continue; }
+    if(c==='"'){inStr=true; continue;}
+    if(c==="{"){ if(depth===0) start=i; depth++; }
+    else if(c==="}"){ depth--; if(depth===0 && start>=0){ out.push(s.slice(start,i+1)); start=-1; } }
+  }
+  return {objs: out, rest: depth>0 && start>=0 ? s.slice(start) : ""};
+}
+
+function handle(e){
+  log("← " + JSON.stringify(e));
+  if(e.ev==="ap"){ scanList.push(e); fillSsid(); }
+  if(e.ev==="ap_done") $("btnScan").disabled=false;
+  if(e.ev==="wifi"){
+    $("netState").textContent = "состояние: " + (e.state||"?") + (e.ssid? " · сеть: "+e.ssid : "") + (e.ip? " · IP: "+e.ip : "") + (e.route!==undefined ? " · интернет: "+(e.route?"есть":"нет") : "");
+  }
+  if(e.ev==="dns"){
+    const arr = Array.isArray(e.fwd) ? e.fwd.filter(Boolean) : (e.fwd && e.fwd!=="auto" ? [e.fwd] : []);
+    $("dnsIn").value = arr[0]||""; $("dnsIn2").value = arr[1]||"";
+    log((e.m? "✓ DNS применён: " : "текущий DNS: ") + (arr.join(" · ")||"auto"));
+  }
+  if(e.ev==="auth" && e.m==="ok") log("✓ запись разрешена");
+  if(e.ev==="dryrun") log("✓ " + (e.m||"dryrun"));
+  if(e.ev==="err") log("✗ " + (e.m||""));
+}
+
+async function onNotify(ev){
+  const txt = new TextDecoder().decode(ev.target.value.byteLength ? new Uint8Array(ev.target.value.buffer) : new Uint8Array());
+  const r = extractJson(buf + txt);
+  buf = r.rest;
+  for(const o of r.objs){ try{ handle(JSON.parse(o)); }catch(_){} }
+}
+
+// GATT write с ответом (Write Request) — полное значение доходит до периферии
+// целиком даже при MTU=23, фрагментацией занимается стек BLE. Поэтому режем
+// команду на чанки по 20 байт только если она явно не влезает: так надёжнее
+// на стеках, которые режут длинное значение молча.
+async function send(obj){
+  if(!chCmd) return;
+  const b = new TextEncoder().encode(JSON.stringify(obj));
+  log("→ " + JSON.stringify(obj));
+  for(let i=0; i<b.length; i+=20){
+    await chCmd.writeValueWithResponse(b.slice(i, i+20));
+  }
+  drain(); // забрать ответы чтением (уведомления — лишь бонус: не все стеки их шлют)
+}
+
+// read-опрос очереди ответов: читаем 0003, пока приходят данные.
+// останавливаемся после 3 пустых подряд, но не раньше чем что-то пришло
+// (скан отвечает через ~3 секунды — первые чтения законно пустые)
+let draining=false;
+async function drain(){
+  if(draining || !chEvt) return;
+  draining=true;
+  try{
+    let empty=0, seen=false;
+    for(let i=0;i<100;i++){
+      const v = await chEvt.readValue();
+      if(!v || !v.byteLength){ empty++; }
+      else {
+        empty=0; seen=true;
+        const txt = new TextDecoder().decode(new Uint8Array(v.buffer));
+        try{ handle(JSON.parse(txt)); }catch(_){ log("← " + txt); }
+      }
+      if(seen && empty>=3) break;
+      await new Promise(r=>setTimeout(r, empty?150:20));
+    }
+  }catch(e){ /* соединение могло закрыться */ }
+  draining=false;
+}
+
+$("btnConn").onclick = async () => {
+  try{
+    device = await navigator.bluetooth.requestDevice({ filters:[{services:[SVC]}], optionalServices:[SVC] });
+    device.addEventListener("gattserverdisconnected", () => {
+      $("connDot").className="dot"; $("connText").textContent="соединение потеряно — повторите «Подключить»";
+      $("authCard").style.display="none"; $("wifiCard").style.display="none"; $("btnDisc").disabled=true; $("btnConn").disabled=false;
+    });
+    $("connText").textContent = "подключение к " + (device.name||device.id) + "…";
+    server = await device.gatt.connect();
+    const s = await server.getPrimaryService(SVC);
+    chCmd = await s.getCharacteristic(C_CMD);
+    chEvt = await s.getCharacteristic(C_EVT);
+    await chEvt.startNotifications();
+    chEvt.addEventListener("characteristicvaluechanged", onNotify);
+    $("connDot").className="dot on"; $("connText").textContent = "подключено: " + (device.name||device.id);
+    $("btnConn").disabled=true; $("btnDisc").disabled=false;
+    $("authCard").style.display=""; $("wifiCard").style.display="";
+    scanList=[]; buf="";
+    await chEvt.readValue().catch(()=>{}); // сбросить хвост старой очереди ответов
+    send({cmd:"wifi.get"});
+  }catch(e){ $("connText").textContent="не подключено"; log("✗ " + e); }
+};
+
+$("btnDisc").onclick = () => { if(device) device.gatt.disconnect(); };
+$("btnAuth").onclick = () => { const p=$("pin").value.trim(); if(!/^\d{4}$|^\d{6}$|^\d{8}$/.test(p)){ log("✗ пин: только цифры, 4/6/8 знаков"); return; } send({cmd:"auth", pin:p}); };
+$("btnRefresh").onclick = () => send({cmd:"wifi.get"});
+$("btnScan").onclick = () => { $("btnScan").disabled=true; scanList=[]; fillSsid(); send({cmd:"wifi.scan"}); };
+// блокеры ввода (скилл проекта): через Bluetooth в колонку не протаскиваем мусор
+const okSsid = s => /^[\x20-\x7e]{1,32}$/.test(s);
+const okPsk  = s => s==="" || /^[\x20-\x7e]{8,63}$/.test(s);
+const okDns  = s => s=="" || s==="auto" || /^((25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}|[0-9a-fA-F:]{2,45})$/.test(s);
+function fillSsid(){
+  const sel=$("ssidSel"); const cur=sel.value; sel.innerHTML='<option value="">— выберите сеть —</option>';
+  scanList.sort((a,b)=>(b.d||0)-(a.d||0));
+  for(const a of scanList){ const o=document.createElement("option"); o.value=a.s; o.textContent=`${a.s}  (${a.d} дБм)`; sel.appendChild(o); }
+  if(cur) sel.value=cur;
+}
+$("btnSetWifi").onclick = () => {
+  const ssid = $("ssidSel").value || $("ssidManual").value.trim();
+  if(!ssid){ log("✗ укажите сеть"); return; }
+  if(!okSsid(ssid)){ log("✗ имя сети: только печатные символы, до 32"); return; }
+  if(!okPsk($("psk").value)){ log("✗ пароль: 8–63 печатных символа (или пусто)"); return; }
+  send({cmd:"wifi.set", ssid, psk:$("psk").value});
+};
+$("btnDnsGet").onclick = () => { $("dnsIn").value=""; $("dnsIn2").value=""; send({cmd:"dns.get"}); };
+$("btnDnsSet").onclick = () => {
+  const d=$("dnsIn").value.trim(), d2=$("dnsIn2").value.trim();
+  if(!okDns(d) || !okDns(d2)){ log("✗ DNS: IPv4/IPv6 в каждое поле (или пусто/auto)"); return; }
+  if(!d && d2){ log("✗ второй адрес без первого — бессмыслица"); return; }
+  send({cmd:"dns.set", forward:d||"auto", ...(d2?{forward2:d2}:{})});
+};
+
+if(!("bluetooth" in navigator)) $("hint").textContent = "Браузер не поддерживает Web Bluetooth — откройте в Chrome или Edge.";
+</script>
+</body>
+</html>
